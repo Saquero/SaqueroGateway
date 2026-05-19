@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 200">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a0f2e"/>
+      <stop offset="100%" stop-color="#581c87"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#c084fc"/>
+      <stop offset="100%" stop-color="#9333ea"/>
+    </linearGradient>
+  </defs>
+  <rect width="160" height="160" rx="32" fill="url(#bg)"/>
+  <path d="M80 22 L118 44 L118 82 C118 108 100 124 80 133 C60 124 42 108 42 82 L42 44 Z" fill="url(#accent)" opacity="0.95"/>
+  <text x="80" y="90" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="44" font-weight="800" fill="white">SQ</text>
+  <text x="80" y="178" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#c084fc" letter-spacing="2">SAQUERO</text>
+  <text x="80" y="196" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="400" fill="#94a3b8" letter-spacing="1">GATEWAY</text>
+</svg>
