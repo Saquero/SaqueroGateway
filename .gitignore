@@ -1,0 +1,24 @@
+## .NET / C#
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.db
+*.db-shm
+*.db-wal
+
+## NuGet
+packages/
+*.nupkg
+project.lock.json
+
+## IDE
+.idea/
+.vscode/
+*.swp
+
+## Entorno
+.env
+launchSettings.json
+appsettings.Development.json
