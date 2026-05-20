@@ -122,6 +122,8 @@ try
         }
     }).AllowAnonymous();
 
+    app.UseMiddleware<ClaimsForwardingMiddleware>();
+
     app.MapReverseProxy();
 
     app.Run();
