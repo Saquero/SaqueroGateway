@@ -26,7 +26,18 @@ try
     var builder = WebApplication.CreateBuilder(args);
     builder.Host.UseSerilog();
 
-    var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+    var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()
+        ?? throw new InvalidOperationException("JwtSettings section is missing from configuration.");
+
+    if (string.IsNullOrWhiteSpace(jwtSettings.SecretKey))
+        throw new InvalidOperationException("JwtSettings:SecretKey is required and cannot be empty.");
+
+    if (string.IsNullOrWhiteSpace(jwtSettings.Issuer))
+        throw new InvalidOperationException("JwtSettings:Issuer is required and cannot be empty.");
+
+    if (string.IsNullOrWhiteSpace(jwtSettings.Audience))
+        throw new InvalidOperationException("JwtSettings:Audience is required and cannot be empty.");
+
     builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("JwtSettings"));
 
     builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -92,7 +103,7 @@ try
     {
         status = "healthy",
         service = "SaqueroGateway",
-        version = "1.0.0",
+        version = "2.0.0",
         timestamp = DateTime.UtcNow
     })).AllowAnonymous();
 
@@ -114,7 +125,9 @@ try
                 {
                     name = e.Key,
                     status = e.Value.Status.ToString(),
-                    description = e.Value.Description
+                    description = e.Value.Description,
+                    latencyMs = e.Value.Data.ContainsKey("latencyMs") ? e.Value.Data["latencyMs"] : null,
+                    statusCode = e.Value.Data.ContainsKey("statusCode") ? e.Value.Data["statusCode"] : null
                 })
             };
             await context.Response.WriteAsync(JsonSerializer.Serialize(result,
@@ -122,9 +135,10 @@ try
         }
     }).AllowAnonymous();
 
-    app.UseMiddleware<ClaimsForwardingMiddleware>();
-
-    app.MapReverseProxy();
+    app.MapReverseProxy(proxyPipeline =>
+    {
+        proxyPipeline.UseMiddleware<ClaimsForwardingMiddleware>();
+    });
 
     app.Run();
 }
