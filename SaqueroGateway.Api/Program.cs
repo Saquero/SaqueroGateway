@@ -65,19 +65,34 @@ try
     builder.Services.AddReverseProxy()
         .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
 
-    builder.Services.AddHttpClient();
+    // Named HttpClient con resilience pipeline para health checks
+    builder.Services.AddHttpClient("health-checks", client =>
+    {
+        client.Timeout = TimeSpan.FromSeconds(5);
+    })
+    .AddStandardResilienceHandler(options =>
+    {
+        options.Retry.MaxRetryAttempts = 2;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(200);
+        options.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(30);
+        options.CircuitBreaker.FailureRatio = 0.5;
+        options.CircuitBreaker.MinimumThroughput = 3;
+        options.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(15);
+        options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(4);
+    });
+
     builder.Services.AddHealthChecks()
         .Add(new HealthCheckRegistration(
             "saquero-cloud",
-            sp => new DownstreamHealthCheck("SaqueroCloud", "http://localhost:5000/health"),
+            sp => new DownstreamHealthCheck("SaqueroCloud", "http://localhost:5000/health", sp.GetRequiredService<IHttpClientFactory>()),
             HealthStatus.Degraded, new[] { "downstream" }))
         .Add(new HealthCheckRegistration(
             "saquero-orders",
-            sp => new DownstreamHealthCheck("SaqueroOrderCore", "http://localhost:8080/actuator/health"),
+            sp => new DownstreamHealthCheck("SaqueroOrderCore", "http://localhost:8080/actuator/health", sp.GetRequiredService<IHttpClientFactory>()),
             HealthStatus.Degraded, new[] { "downstream" }))
         .Add(new HealthCheckRegistration(
             "saquero-jobs",
-            sp => new DownstreamHealthCheck("SaqueroJobs", "http://localhost:5200/health"),
+            sp => new DownstreamHealthCheck("SaqueroJobs", "http://localhost:5200/health", sp.GetRequiredService<IHttpClientFactory>()),
             HealthStatus.Degraded, new[] { "downstream" }));
 
     var app = builder.Build();

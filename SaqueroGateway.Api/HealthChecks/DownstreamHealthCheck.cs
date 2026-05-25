@@ -7,11 +7,13 @@ public class DownstreamHealthCheck : IHealthCheck
 {
     private readonly string _serviceName;
     private readonly string _healthUrl;
+    private readonly IHttpClientFactory _httpClientFactory;
 
-    public DownstreamHealthCheck(string serviceName, string healthUrl)
+    public DownstreamHealthCheck(string serviceName, string healthUrl, IHttpClientFactory httpClientFactory)
     {
         _serviceName = serviceName;
         _healthUrl = healthUrl;
+        _httpClientFactory = httpClientFactory;
     }
 
     public async Task<HealthCheckResult> CheckHealthAsync(
@@ -21,7 +23,7 @@ public class DownstreamHealthCheck : IHealthCheck
         var sw = Stopwatch.StartNew();
         try
         {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var client = _httpClientFactory.CreateClient("health-checks");
             var response = await client.GetAsync(_healthUrl, cancellationToken);
             sw.Stop();
 
