@@ -1,16 +1,12 @@
-using System.Text;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.AspNetCore.Diagnostics.HealthChecks;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
-using Microsoft.IdentityModel.Tokens;
 using Serilog;
 using Serilog.Events;
-using SaqueroGateway.Api.Configuration;
+using SaqueroGateway.Api.Extensions;
 using SaqueroGateway.Api.HealthChecks;
 using SaqueroGateway.Api.Middleware;
+using SaqueroGateway.Api.RateLimiting;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using System.Text.Json;
-using System.Threading.RateLimiting;
-using Microsoft.AspNetCore.RateLimiting;
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
@@ -26,73 +22,33 @@ try
     var builder = WebApplication.CreateBuilder(args);
     builder.Host.UseSerilog();
 
-    var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
-    builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("JwtSettings"));
-
-    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-        .AddJwtBearer(options =>
-        {
-            options.TokenValidationParameters = new TokenValidationParameters
-            {
-                ValidateIssuer = true,
-                ValidateAudience = true,
-                ValidateLifetime = true,
-                ValidateIssuerSigningKey = true,
-                ValidIssuer = jwtSettings.Issuer,
-                ValidAudience = jwtSettings.Audience,
-                IssuerSigningKey = new SymmetricSecurityKey(
-                    Encoding.UTF8.GetBytes(jwtSettings.SecretKey))
-            };
-        });
-
-    builder.Services.AddAuthorization(options =>
-    {
-        options.AddPolicy("authenticated", policy => policy.RequireAuthenticatedUser());
-    });
-
-    builder.Services.AddRateLimiter(options =>
-    {
-        options.AddFixedWindowLimiter("global", limiter =>
-        {
-            limiter.Window = TimeSpan.FromMinutes(1);
-            limiter.PermitLimit = 100;
-            limiter.QueueLimit = 0;
-        });
-        options.RejectionStatusCode = 429;
-    });
+    builder.Services
+        .AddGatewayAuth(builder.Configuration)
+        .AddGatewayRateLimiting()
+        .AddGatewayResilience()
+        .AddGatewayHealthChecks();
 
     builder.Services.AddReverseProxy()
         .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
 
-    builder.Services.AddHttpClient();
-    builder.Services.AddHealthChecks()
-        .Add(new HealthCheckRegistration(
-            "saquero-cloud",
-            sp => new DownstreamHealthCheck("SaqueroCloud", "http://localhost:5000/health"),
-            HealthStatus.Degraded, new[] { "downstream" }))
-        .Add(new HealthCheckRegistration(
-            "saquero-orders",
-            sp => new DownstreamHealthCheck("SaqueroOrderCore", "http://localhost:8080/actuator/health"),
-            HealthStatus.Degraded, new[] { "downstream" }))
-        .Add(new HealthCheckRegistration(
-            "saquero-jobs",
-            sp => new DownstreamHealthCheck("SaqueroJobs", "http://localhost:5200/health"),
-            HealthStatus.Degraded, new[] { "downstream" }));
+    builder.Services.AddProblemDetails();
 
     var app = builder.Build();
 
+    app.UseExceptionHandler();
+    app.UseStatusCodePages();
     app.UseMiddleware<ErrorHandlingMiddleware>();
     app.UseMiddleware<CorrelationIdMiddleware>();
     app.UseMiddleware<RequestLoggingMiddleware>();
-    app.UseRateLimiter();
     app.UseAuthentication();
     app.UseAuthorization();
+    app.UseRateLimiter();
 
     app.MapGet("/health", () => Results.Ok(new
     {
         status = "healthy",
         service = "SaqueroGateway",
-        version = "1.0.0",
+        version = "2.0.0",
         timestamp = DateTime.UtcNow
     })).AllowAnonymous();
 
@@ -114,7 +70,9 @@ try
                 {
                     name = e.Key,
                     status = e.Value.Status.ToString(),
-                    description = e.Value.Description
+                    description = e.Value.Description,
+                    latencyMs = e.Value.Data.ContainsKey("latencyMs") ? e.Value.Data["latencyMs"] : null,
+                    statusCode = e.Value.Data.ContainsKey("statusCode") ? e.Value.Data["statusCode"] : null
                 })
             };
             await context.Response.WriteAsync(JsonSerializer.Serialize(result,
@@ -122,9 +80,10 @@ try
         }
     }).AllowAnonymous();
 
-    app.UseMiddleware<ClaimsForwardingMiddleware>();
-
-    app.MapReverseProxy();
+    app.MapReverseProxy(proxyPipeline =>
+    {
+        proxyPipeline.UseMiddleware<ClaimsForwardingMiddleware>();
+    }).RequireRateLimiting(TenantRateLimitingPolicy.PolicyName);
 
     app.Run();
 }

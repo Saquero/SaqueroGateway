@@ -1,18 +1,16 @@
-# Architecture — SaqueroGateway
+# Architecture - SaqueroGateway
 
 ## Overview
 
-SaqueroGateway is a purpose-built API Gateway. It has no domain logic, no database, and no business rules. Its sole responsibility is to act as a secure, observable entry point for the Saquero backend ecosystem.
-
-This document explains the architectural decisions behind every component.
+SaqueroGateway is a purpose-built API Gateway. It has no domain logic, no database, and no business rules. Its sole responsibility is to act as a secure, observable, resilient entry point for the Saquero backend ecosystem.
 
 ---
 
 ## Why no Clean Architecture or DDD?
 
-Clean Architecture and DDD exist to manage domain complexity. A gateway has no domain — it has infrastructure concerns only: routing, authentication, rate limiting, logging.
+Clean Architecture and DDD exist to manage domain complexity. A gateway has no domain - it has infrastructure concerns only: routing, authentication, rate limiting, logging, resilience.
 
-Applying Clean Architecture here would mean creating Application, Domain and Infrastructure layers with nothing meaningful to put in them. That is not architecture — it is ceremony.
+Applying Clean Architecture here would mean creating Application, Domain and Infrastructure layers with nothing meaningful to put in them. That is not architecture - it is ceremony.
 
 The correct pattern for a gateway is a flat, well-organized infrastructure project with clear separation of concerns via middleware pipeline. That is what this project implements.
 
@@ -21,170 +19,209 @@ The correct pattern for a gateway is a flat, well-organized infrastructure proje
 ## Project Structure
 
 ```text
-SaqueroGateway/
-├── SaqueroGateway.Api/
-│   ├── Configuration/
-│   │   └── JwtSettings.cs          -- strongly-typed config binding
-│   ├── HealthChecks/
-│   │   └── DownstreamHealthCheck.cs -- IHealthCheck implementation per service
-│   ├── Middleware/
-│   │   ├── CorrelationIdMiddleware.cs
-│   │   ├── ErrorHandlingMiddleware.cs
-│   │   └── RequestLoggingMiddleware.cs
-│   ├── Models/
-│   │   └── ErrorResponse.cs        -- uniform error contract
-│   ├── appsettings.json            -- YARP routes + cluster config
-│   └── Program.cs                  -- composition root
+SaqueroGateway.Api/
++-- Configuration/
+|   +-- JwtSettings.cs                  -- strongly-typed config with DataAnnotations
++-- Extensions/
+|   +-- AuthExtensions.cs               -- AddGatewayAuth
+|   +-- HealthCheckExtensions.cs        -- AddGatewayHealthChecks
+|   +-- RateLimitingExtensions.cs       -- AddGatewayRateLimiting
+|   +-- ResilienceExtensions.cs         -- AddGatewayResilience
++-- HealthChecks/
+|   +-- DownstreamHealthCheck.cs        -- IHealthCheck with latency tracking
++-- Middleware/
+|   +-- CorrelationIdMiddleware.cs      -- X-Correlation-Id generation + propagation
+|   +-- ErrorHandlingMiddleware.cs      -- uniform error contract
+|   +-- ClaimsForwardingMiddleware.cs   -- identity headers to downstream
+|   +-- RequestLoggingMiddleware.cs     -- structured request/response logging
++-- Models/
+|   +-- ErrorResponse.cs               -- uniform error response record
++-- RateLimiting/
+|   +-- TenantRateLimitingPolicy.cs     -- plan-based partitioned rate limiting
++-- appsettings.json                    -- YARP routes + cluster config
++-- Program.cs                          -- composition root
 ```
 
 ---
 
 ## Middleware Pipeline
 
-Every HTTP request passes through this pipeline in order:
-
 ```text
 1. ErrorHandlingMiddleware
    Wraps the entire pipeline in a try/catch.
-   Any unhandled exception returns a uniform ErrorResponse JSON.
-   Always runs -- positioned first so nothing escapes unhandled.
+   Returns uniform ErrorResponse JSON with correlationId on any unhandled exception.
 
 2. CorrelationIdMiddleware
-   Reads X-Correlation-Id from the incoming request header.
-   If absent, generates a new GUID.
-   Writes it to HttpContext.Items and the response header.
-   Pushes it into Serilog LogContext so every log line carries it.
+   Reads X-Correlation-Id from incoming request. Generates GUID if absent.
+   Writes to HttpContext.Items and response header.
+   Pushes into Serilog LogContext - every log line in the request carries it.
 
 3. RequestLoggingMiddleware
-   Starts a Stopwatch before calling next().
-   After the response is written, logs: Method, Path, StatusCode, Duration, CorrelationId.
-   Structured log -- ready for any log aggregator (Seq, ELK, Datadog).
+   Stopwatch starts before next(). Logs after response:
+   Method, Path, StatusCode, Duration, CorrelationId.
+   Structured output - compatible with Seq, ELK, Datadog, Application Insights.
 
-4. RateLimiter
-   Fixed window: 100 requests per minute per IP.
-   Runs before authentication -- unauthenticated abuse is stopped here.
-   Returns 429 Too Many Requests on limit breach.
+4. Authentication
+   Validates JWT: signature (HS256), issuer, audience, expiry.
+   Does NOT issue tokens - that is SaqueroCloud's responsibility.
+   Populates HttpContext.User with claims for downstream middleware.
 
-5. Authentication
-   Validates JWT signature using the shared HS256 secret.
-   Validates issuer, audience, and expiry.
-   Does NOT issue tokens -- that is SaqueroCloud's responsibility.
+5. Authorization
+   Enforces "authenticated" policy on all /gateway/** routes.
+   Returns 401 (no token) or 403 (invalid token).
 
-6. Authorization
-   Enforces the "authenticated" policy on all /gateway/** routes.
-   Returns 401 if no token, 403 if token is invalid.
+6. RateLimiter
+   Runs after auth so HttpContext.User is populated with real claims.
+   Partition key: {plan}:{userId} - each user has an independent counter.
+   free: 30/min | premium: 200/min | admin: 500/min
+   Returns structured 429 JSON on rejection, logs userId + plan.
 
 7. YARP ReverseProxy
-   Routes the request to the correct downstream cluster.
-   Strips the /gateway/{service} prefix before forwarding.
-   Downstream services receive a clean request as if called directly.
+   Routes request to downstream cluster based on appsettings.json config.
+   Strips /gateway/{service} prefix before forwarding.
+
+   Inside YARP pipeline:
+   ClaimsForwardingMiddleware
+     Extracts identity from validated JWT claims.
+     Forwards: X-User-Id, X-User-Email, X-User-Role, X-User-Plan,
+               X-Tenant-Id, X-Forwarded-For, X-Correlation-Id.
+     Downstream services trust these headers without re-validating the token.
 ```
 
 ---
 
-## YARP Configuration
+## Tenant-Aware Rate Limiting Design
 
-Routes and clusters are declared in `appsettings.json` -- no code changes needed to add a new service.
+Rate limiting runs after authentication deliberately.
 
-```json
-{
-  "ReverseProxy": {
-    "Routes": {
-      "cloud-route": {
-        "ClusterId": "cloud-cluster",
-        "AuthorizationPolicy": "authenticated",
-        "Match": { "Path": "/gateway/cloud/{**catch-all}" },
-        "Transforms": [{ "PathRemovePrefix": "/gateway/cloud" }]
-      }
-    },
-    "Clusters": {
-      "cloud-cluster": {
-        "Destinations": {
-          "cloud-destination": { "Address": "http://localhost:5000" }
-        }
-      }
-    }
-  }
-}
+Before auth: only IP-based limiting is possible. IPs are spoofable and shared (NAT, proxies).
+After auth: user identity is known. Each user gets their own partition regardless of IP.
+
+The partition key is {plan}:{userId}. This means:
+- Two free users never share a limit bucket.
+- A premium user is never affected by a free user's traffic.
+- Plan upgrades are reflected immediately on next token issuance.
+
+```csharp
+RateLimitPartition.GetFixedWindowLimiter(
+    partitionKey: $"{plan}:{userId}",
+    factory: _ => new FixedWindowRateLimiterOptions { ... }
+)
 ```
 
-Adding a new downstream service requires only a new route + cluster entry. Zero code changes.
+---
+
+## Modular Startup
+
+Each infrastructure concern is isolated in a dedicated extension method.
+Program.cs is a composition root - it wires, it does not implement.
+
+```csharp
+builder.Services
+    .AddGatewayAuth(builder.Configuration)
+    .AddGatewayRateLimiting()
+    .AddGatewayResilience()
+    .AddGatewayHealthChecks();
+```
+
+Adding a new infrastructure concern means adding a new extension file.
+No existing code is touched. Open/Closed in practice.
+
+---
+
+## Resilience Pipeline
+
+Health check HTTP clients use Microsoft.Extensions.Http.Resilience
+with AddStandardResilienceHandler.
+
+Three layers of protection:
+
+Retry - transient failures are retried before reporting unhealthy.
+  2 attempts, 200ms delay.
+
+Circuit Breaker - if a downstream fails consistently (50% failure rate
+  over 30s, minimum 3 requests), the circuit opens. For 15 seconds,
+  calls fail immediately without attempting a connection.
+  Prevents thread exhaustion from slow downstreams cascading into
+  gateway slowdowns.
+
+Attempt Timeout - each individual attempt has a 4-second hard timeout,
+  independent of the HttpClient global timeout.
 
 ---
 
 ## JWT Strategy
 
-| Concern          | Owner          | Reason                                      |
-| ---------------- | -------------- | ------------------------------------------- |
-| Token issuance   | SaqueroCloud   | Auth is a business concern, not gateway     |
-| Token validation | SaqueroGateway | Every request must be validated at the edge |
-| Token storage    | Client         | Stateless -- no session on the gateway      |
+| Concern           | Owner          | Reason                                      |
+| ----------------- | -------------- | ------------------------------------------- |
+| Token issuance    | SaqueroCloud   | Auth is a business concern, not gateway     |
+| Token validation  | SaqueroGateway | Every request validated at the edge once    |
+| Claims forwarding | SaqueroGateway | Downstream trusts gateway identity headers  |
+| Token storage     | Client         | Stateless - no session on the gateway       |
 
-The gateway shares the signing key with SaqueroCloud via `dotnet user-secrets` in development. In production this would be an environment variable or a secrets manager (Azure Key Vault, AWS Secrets Manager).
+Secret key managed via dotnet user-secrets in development.
+Production: environment variable or Azure Key Vault / AWS Secrets Manager.
 
-Algorithm: HS256 (symmetric). Production systems with multiple issuers would use RS256 with JWKS endpoint discovery.
+Algorithm: HS256 (symmetric, single issuer).
+Multi-issuer production setup would use RS256 with JWKS endpoint discovery.
+
+---
+
+## Startup Validation
+
+At boot, the gateway validates all required configuration before accepting traffic.
+JwtSettings uses DataAnnotations with ValidateOnStart():
+
+- SecretKey: required, minimum 32 characters
+- Issuer: required
+- Audience: required
+
+Missing configuration throws InvalidOperationException at startup.
+A gateway that starts without a signing key would silently accept unsigned tokens.
+That is a security hole, not a degraded mode.
 
 ---
 
 ## Health Check Design
 
-`/health` -- gateway self-check. Always returns 200 if the process is running.
+/health - gateway self-check. Returns 200 if the process is running. Version included.
 
-`/health/downstream` -- polls each downstream service independently. Always returns 200 regardless of downstream status. Per-service status is in the response body.
+/health/downstream - polls each downstream independently via resilience-backed
+HttpClient. Always returns HTTP 200. Per-service status, description, latency,
+and status code in body.
 
-This design is intentional: a health endpoint that returns 503 when a downstream is down makes the gateway itself appear unhealthy to load balancers, which is incorrect. The gateway is healthy -- a downstream is not.
-
-```json
-{
-  "status": "Unhealthy",
-  "services": [
-    {
-      "name": "saquero-cloud",
-      "status": "Healthy",
-      "description": "SaqueroCloud is reachable."
-    },
-    {
-      "name": "saquero-orders",
-      "status": "Unhealthy",
-      "description": "SaqueroOrderCore is unreachable."
-    },
-    {
-      "name": "saquero-jobs",
-      "status": "Unhealthy",
-      "description": "SaqueroJobs is unreachable."
-    }
-  ]
-}
-```
+Why always 200? A gateway that returns 503 when a downstream is down tells load
+balancers the gateway itself is unhealthy. That is incorrect - the gateway is
+running fine. The body contains the full truth. HTTP status reflects gateway
+health, not downstream health.
 
 ---
 
 ## Correlation ID Flow
 
 ```text
-Client                  Gateway                 Downstream
-  |                       |                         |
-  |-- GET /gateway/cloud  |                         |
-  |   (no correlation id) |                         |
-  |                       |-- generate GUID         |
-  |                       |   add to LogContext     |
-  |                       |                         |
-  |                       |-- forward request ----> |
-  |                       |   X-Correlation-Id: abc |
-  |                       |                         |
-  |                       |<-- response ----------- |
-  |                       |                         |
-  |<-- response ----------|                         |
-  |   X-Correlation-Id: abc                         |
+Client                    Gateway                      Downstream
+  |                          |                              |
+  |-- request (no corr-id) ->|                              |
+  |                          |-- generate GUID              |
+  |                          |   push to Serilog context    |
+  |                          |                              |
+  |                          |-- forward + X-Correlation-Id |
+  |                          |                         ---> |
+  |                          |<-- response ----------------  |
+  |<-- response + header ----|                              |
+  |   X-Correlation-Id: abc                                 |
 ```
 
-If the client sends `X-Correlation-Id`, the gateway reuses it. This allows end-to-end tracing from client to downstream across the full call chain.
+If client sends X-Correlation-Id, gateway reuses it.
+End-to-end tracing from client through gateway to all downstream services
+without a full observability stack.
 
 ---
 
 ## Error Contract
 
-All unhandled errors return a uniform JSON structure:
+All unhandled exceptions return:
 
 ```json
 {
@@ -195,17 +232,37 @@ All unhandled errors return a uniform JSON structure:
 }
 ```
 
-Downstream errors (4xx, 5xx from proxied services) are passed through as-is -- the gateway does not rewrite downstream error responses.
+Downstream 4xx/5xx responses pass through as-is.
+The gateway does not rewrite downstream errors.
 
 ---
 
-## Intentional Limitations (Portfolio Scope)
+## YARP Configuration
 
-These are known gaps, documented as future work:
+Routes and clusters are fully declarative in appsettings.json.
+Adding a new downstream service requires zero code changes.
 
-- **No header propagation** -- X-User-Id, X-Tenant-Id are not forwarded to downstream services yet.
-- **No per-user rate limiting** -- current policy is per-IP only.
-- **No request/response transformation** -- YARP supports this; not implemented.
-- **No HTTPS** -- HTTP only in development. Production would terminate TLS at the gateway.
-- **No integration tests** -- unit tests cover middleware; integration tests with TestContainers are planned.
-- **Symmetric JWT** -- HS256 is fine for a single issuer. RS256 with JWKS would be used in production.
+```json
+"new-service-route": {
+  "ClusterId": "new-service-cluster",
+  "AuthorizationPolicy": "authenticated",
+  "Match": { "Path": "/gateway/new-service/{**catch-all}" },
+  "Transforms": [{ "PathRemovePrefix": "/gateway/new-service" }]
+},
+"new-service-cluster": {
+  "Destinations": {
+    "new-service-destination": { "Address": "http://localhost:XXXX" }
+  }
+}
+```
+
+---
+
+## Future Improvements
+
+- OpenTelemetry traces exported to Jaeger / Zipkin
+- RS256 JWT with JWKS discovery (multi-issuer)
+- Docker Compose for full ecosystem
+- Integration tests with TestContainers
+- Prometheus /metrics endpoint
+- HTTPS termination
