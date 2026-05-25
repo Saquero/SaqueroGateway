@@ -22,3 +22,10 @@ project.lock.json
 .env
 launchSettings.json
 appsettings.Development.json
+
+## Temp / backups
+*.bak
+*.tmp
+*.old
+*.orig
+TestResults/
