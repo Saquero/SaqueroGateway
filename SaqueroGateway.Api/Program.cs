@@ -8,9 +8,8 @@ using Serilog.Events;
 using SaqueroGateway.Api.Configuration;
 using SaqueroGateway.Api.HealthChecks;
 using SaqueroGateway.Api.Middleware;
+using SaqueroGateway.Api.RateLimiting;
 using System.Text.Json;
-using System.Threading.RateLimiting;
-using Microsoft.AspNetCore.RateLimiting;
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
@@ -61,16 +60,7 @@ try
         options.AddPolicy("authenticated", policy => policy.RequireAuthenticatedUser());
     });
 
-    builder.Services.AddRateLimiter(options =>
-    {
-        options.AddFixedWindowLimiter("global", limiter =>
-        {
-            limiter.Window = TimeSpan.FromMinutes(1);
-            limiter.PermitLimit = 100;
-            limiter.QueueLimit = 0;
-        });
-        options.RejectionStatusCode = 429;
-    });
+    builder.Services.AddRateLimiter(TenantRateLimitingPolicy.Configure);
 
     builder.Services.AddReverseProxy()
         .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
@@ -95,9 +85,9 @@ try
     app.UseMiddleware<ErrorHandlingMiddleware>();
     app.UseMiddleware<CorrelationIdMiddleware>();
     app.UseMiddleware<RequestLoggingMiddleware>();
-    app.UseRateLimiter();
     app.UseAuthentication();
     app.UseAuthorization();
+    app.UseRateLimiter();
 
     app.MapGet("/health", () => Results.Ok(new
     {
@@ -138,7 +128,7 @@ try
     app.MapReverseProxy(proxyPipeline =>
     {
         proxyPipeline.UseMiddleware<ClaimsForwardingMiddleware>();
-    });
+    }).RequireRateLimiting(TenantRateLimitingPolicy.PolicyName);
 
     app.Run();
 }
